@@ -1,25 +1,21 @@
-using Newtonsoft.Json;
+using System.Net;
+using System.Reactive.Linq;
+using System.Reactive.Threading.Tasks;
 using BotCripto.Models;
+using InterReact;
 
 namespace BotCripto.Services;
 
 public class InteractiveBrokersDataService
 {
-    private readonly HttpClient _httpClient;
+    private IInterReactClient? _ibClient;
     private string _sessionId = "";
-    private const string ClientPortalUrl = "https://localhost:5000/api";
-    private const string TwsDirectUrl = "localhost:7497";
-    private const string FinnhubApiUrl = "https://finnhub.io/api/v1";
-    private const string FinnhubApiKey = "daggpk9r01quf8mu8vkgdaggpk9r01quf8mu8vl0";
     private readonly string _accountId = "";
-    private int _apiCallCount = 0;
     private DateTime _lastApiCallTime = DateTime.UtcNow;
     private const int RateLimitDelayMs = 50;
     private bool _useRealtimeMode = true;
     private Dictionary<string, decimal> _priceCache = new();
     private DateTime _lastCacheUpdate = DateTime.MinValue;
-    private bool _useFinnhubForRealData = false; // Fallback only - non primaria
-    private bool _fallbackToFinnhub = false; // Attivato quando TWS è offline
     private string _currentDataSource = "InteractiveBrokers"; // Traccia la fonte dati attuale
 
     // Simboli del mercato italiano predefiniti
@@ -42,125 +38,54 @@ public class InteractiveBrokersDataService
         "UNL"           // Unilever
     };
 
-    public InteractiveBrokersDataService(string accountId = "", bool useLocalGateway = true)
+    public InteractiveBrokersDataService(string accountId = "")
     {
         _accountId = accountId;
-        _httpClient = new HttpClient();
-
-        // Per evitare errori SSL in sviluppo se si usa local gateway
-        if (useLocalGateway)
-        {
-            var handler = new HttpClientHandler();
-            handler.ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true;
-            _httpClient = new HttpClient(handler);
-        }
-
-        _httpClient.Timeout = TimeSpan.FromSeconds(30);
-        _httpClient.DefaultRequestHeaders.Add("Accept", "application/json");
-        _httpClient.DefaultRequestHeaders.Add("User-Agent", "BotCripto/1.1");
     }
 
     public async Task<bool> ConnectAsync(string username, string password)
     {
         try
         {
-            Console.WriteLine("🔌 Tentativo connessione Interactive Brokers TWS Socket (porta 7497)...");
+            Console.WriteLine("🔌 Tentativo connessione Interactive Brokers TWS (porta 7497)...");
 
-            // Tenta PRIMA connessione diretta a TWS
-            if (await TryConnectDirectToTws())
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            _ibClient = await InterReactClient.ConnectAsync(o =>
             {
-                Console.WriteLine("✅ Connessione DIRETTA a TWS Socket ATTIVA (Real-Time)");
-                _useRealtimeMode = true;
-                _sessionId = "tws_direct_socket";
-                _fallbackToFinnhub = false;
-                _currentDataSource = "InteractiveBrokers (TWS Real-Time)";
-                return true;
-            }
+                o.TwsIpAddress = IPAddress.Loopback;
+                o.IBPortAddresses = new[] { 7497 };
+            }, cts.Token);
 
-            Console.WriteLine("❌ TWS non disponibile sulla porta 7497");
+            // Usa dati differiti se il conto non ha una sottoscrizione real-time per il titolo richiesto
+            // (viene ignorato automaticamente quando i dati real-time sono disponibili).
+            _ibClient.Request.RequestMarketDataType(MarketDataType.Delayed);
+
+            // Logga gli alert di TWS (es. contratto non trovato, sottoscrizione dati mancante)
+            // per poter diagnosticare perché una richiesta non restituisce dati.
+            _ibClient.Response
+                .OfType<AlertMessage>()
+                .Subscribe(a => Console.WriteLine($"   ℹ️  IB Alert [{a.Code}]: {a.Message}"));
+
+            Console.WriteLine($"✅ Connessione TWS ATTIVA su {_ibClient.RemoteIpEndPoint} (Real-Time)");
+            _useRealtimeMode = true;
+            _sessionId = "tws_direct_socket";
+            _currentDataSource = "InteractiveBrokers (TWS Real-Time)";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ TWS non disponibile sulla porta 7497: {ex.Message}");
             Console.WriteLine("📝 Assicurati che:");
             Console.WriteLine("   1. TWS sia aperto e in esecuzione");
             Console.WriteLine("   2. API sia abilitata: Settings → API → Settings → Enable ActiveX and Socket Clients");
             Console.WriteLine("   3. La porta 7497 sia accessibile");
-            Console.WriteLine("\n🔄 Attivazione FALLBACK SYSTEM → Tentando connessione Finnhub...");
-
-            // Fallback a Finnhub se TWS non disponibile
-            if (await TestFinnhubConnection())
-            {
-                Console.WriteLine("✅ Fallback Finnhub ATTIVO (Real-Time Market Data)");
-                _useRealtimeMode = true;
-                _sessionId = "finnhub_fallback";
-                _fallbackToFinnhub = true;
-                _currentDataSource = "Finnhub API (Fallback)";
-                Console.WriteLine("⚠️  NOTA: Operando in modalità FALLBACK - Performance dati leggermente inferiori");
-                return true;
-            }
-
-            Console.WriteLine("❌ Anche Finnhub non disponibile");
             Console.WriteLine("⚠️  ATTENZIONE: Sistema operando in modalità DEMO (nessun fallback disponibile)");
+            _ibClient = null;
             _useRealtimeMode = false;
             _sessionId = "demo_only";
             _currentDataSource = "Demo Data";
             return false;
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"❌ Errore connessione: {ex.Message}");
-            _useRealtimeMode = false;
-            _currentDataSource = "Demo Data (Error)";
-            return false;
-        }
-    }
-
-    private async Task<bool> TestFinnhubConnection()
-    {
-        try
-        {
-            if (string.IsNullOrEmpty(FinnhubApiKey) || FinnhubApiKey == "YOUR_FINNHUB_API_KEY")
-            {
-                Console.WriteLine("⚠️  Chiave API Finnhub non configurata");
-                return false;
-            }
-
-            // Testa connessione Finnhub con un simbolo generico
-            var url = $"{FinnhubApiUrl}/quote?symbol=ENI.MI&token={FinnhubApiKey}";
-            var response = await _httpClient.GetAsync(url);
-
-            if (response.IsSuccessStatusCode)
-            {
-                Console.WriteLine("✅ Finnhub risponde correttamente");
-                return true;
-            }
-
-            Console.WriteLine($"⚠️  Finnhub - Stato HTTP: {response.StatusCode}");
-            return false;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"❌ Errore test Finnhub: {ex.Message}");
-            return false;
-        }
-    }
-
-    private async Task<bool> TryConnectDirectToTws()
-    {
-        try
-        {
-            using (var client = new System.Net.Sockets.TcpClient())
-            {
-                var connectTask = client.ConnectAsync("localhost", 7497);
-                var completed = await Task.WhenAny(connectTask, Task.Delay(3000));
-
-                if (completed == connectTask && client.Connected)
-                {
-                    Console.WriteLine("✅ TWS risponde su porta 7497");
-                    client.Close();
-                    return true;
-                }
-            }
-        }
-        catch { }
-        return false;
     }
 
     public async Task<List<Cryptocurrency>> GetItalianStocksAsync()
@@ -194,12 +119,6 @@ public class InteractiveBrokersDataService
 
             // Formato IB: Per borsa italiana aggiungi .MI al simbolo
             var ibSymbol = symbol.Contains(".") ? symbol : $"{symbol}.MI";
-
-            // Endpoint di example - in produzione useresti l'API di IB reale
-            // var url = $"{ClientPortalUrl}/iserver/marketdata/latest?conids=<conid>";
-
-            // Per ora, simuliamo i dati dal mercato italiano
-            // In produzione, integrerai direttamente con l'API IB
 
             var price = await GetMarketPriceAsync(ibSymbol);
 
@@ -237,37 +156,19 @@ public class InteractiveBrokersDataService
             }
 
             // PRIMO TENTATIVO: Interactive Brokers TWS (PRIMARIA)
-            if (_sessionId == "tws_direct_socket")
+            if (_sessionId == "tws_direct_socket" && _ibClient != null)
             {
-                var price = await GetPriceFromTwsDirectSocket("", ibSymbol);
+                var price = await GetPriceFromTwsAsync(ibSymbol);
                 if (price > 0)
                 {
                     _priceCache[ibSymbol] = price;
                     _lastCacheUpdate = DateTime.UtcNow;
-                    Console.WriteLine($"✅ {ibSymbol}: €{price:F2} (IB TWS - Primary)");
+                    Console.WriteLine($"✅ {ibSymbol}: €{price:F2} (IB TWS - Real-Time)");
                     return price;
                 }
                 else
                 {
-                    Console.WriteLine($"⚠️  {ibSymbol}: TWS non ha dati, tentando Finnhub...");
-                }
-            }
-
-            // FALLBACK 1: Finnhub API (Se TWS non disponibile o no dati)
-            if (!string.IsNullOrEmpty(FinnhubApiKey) && FinnhubApiKey != "YOUR_FINNHUB_API_KEY")
-            {
-                var price = await GetPriceFromFinnhub(ibSymbol);
-                if (price > 0)
-                {
-                    _priceCache[ibSymbol] = price;
-                    _lastCacheUpdate = DateTime.UtcNow;
-                    var source = _fallbackToFinnhub ? "Finnhub (Fallback)" : "Finnhub (Fallback - TWS offline)";
-                    Console.WriteLine($"✅ {ibSymbol}: €{price:F2} ({source})");
-                    return price;
-                }
-                else
-                {
-                    Console.WriteLine($"⚠️  {ibSymbol}: Finnhub non ha dati, usando demo...");
+                    Console.WriteLine($"⚠️  {ibSymbol}: TWS non ha dati, usando demo...");
                 }
             }
 
@@ -282,131 +183,31 @@ public class InteractiveBrokersDataService
         }
     }
 
-    private async Task<decimal> GetPriceFromFinnhub(string symbol)
+    private async Task<decimal> GetPriceFromTwsAsync(string ibSymbol)
     {
+        if (_ibClient == null)
+            return -1m;
+
         try
         {
-            // Prova multiple formati per Finnhub
-            string ticker = symbol.Contains(".") ? symbol.Replace(".MI", "") : symbol;
+            var contract = BuildItalianContract(ibSymbol);
 
-            // Tenta con diversi formati di ticker
-            string[] tickerFormats = new[]
-            {
-                $"{ticker}.MI",      // Borsa Italiana
-                ticker,              // Simbolo base
-                $"{ticker}-MI",      // Formato alternativo
-            };
+            IHasRequestId[] snapshot = await _ibClient.Service.GetMarketDataSnapshotAsync(
+                contract,
+                timeout: TimeSpan.FromSeconds(8));
 
-            foreach (var tickerFormat in tickerFormats)
-            {
-                try
-                {
-                    var url = $"{FinnhubApiUrl}/quote?symbol={tickerFormat}&token={FinnhubApiKey}";
-                    Console.WriteLine($"🔍 Tentando Finnhub: {tickerFormat}...");
+            var priceTicks = snapshot.OfTickClass(s => s.PriceTick).ToList();
 
-                    await RateLimitDelay();
-                    var response = await _httpClient.GetAsync(url);
+            var tick = priceTicks.FirstOrDefault(t => t.TickType == TickType.LastPrice && t.Price > 0)
+                ?? priceTicks.FirstOrDefault(t => t.TickType == TickType.ClosePrice && t.Price > 0);
 
-                    Console.WriteLine($"   Stato HTTP: {response.StatusCode}");
-
-                    if (response.IsSuccessStatusCode)
-                    {
-                        var content = await response.Content.ReadAsStringAsync();
-                        Console.WriteLine($"   Risposta: {content}");
-                        dynamic data = JsonConvert.DeserializeObject(content);
-
-                        if (data != null && data.c != null && data.c > 0)
-                        {
-                            decimal price = decimal.Parse(data.c.ToString());
-                            if (price > 0)
-                            {
-                                Console.WriteLine($"✅ 📡 Finnhub: {tickerFormat} = €{price:F2} (Real-Time)");
-                                return price;
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine($"   Prezzo non valido: c={data?.c}");
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine($"   Errore HTTP: {response.StatusCode}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"   Exception: {ex.Message}");
-                }
-            }
-
-            Console.WriteLine($"⚠️  Finnhub: Non disponibile per {ticker}");
+            return tick != null ? (decimal)tick.Price : -1m;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"❌ Finnhub Exception ({symbol}): {ex.Message}");
+            Console.WriteLine($"   ⚠️  TWS market data ({ibSymbol}): {ex.Message}");
+            return -1m;
         }
-        return -1m;
-    }
-
-    private async Task<decimal> GetPriceFromTwsDirectSocket(string conId, string ibSymbol)
-    {
-        try
-        {
-            using (var client = new System.Net.Sockets.TcpClient())
-            {
-                // Connessione al socket TWS
-                var connectTask = client.ConnectAsync("localhost", 7497);
-                var completed = await Task.WhenAny(connectTask, Task.Delay(3000));
-
-                if (completed != connectTask || !client.Connected)
-                {
-                    return -1m;
-                }
-
-                // Usa NetworkStream per comunicare con TWS
-                using (var stream = client.GetStream())
-                {
-                    // Costruisci il comando TWS per richiedere il prezzo
-                    // Formato: reqMktData|id|conId|genericTickList|snapshot
-                    string tickCommand = $"1\x00reqMktData\x001\x00{conId}\x00\x001\x00";
-
-                    byte[] buffer = System.Text.Encoding.ASCII.GetBytes(tickCommand);
-                    stream.Write(buffer, 0, buffer.Length);
-                    stream.Flush();
-
-                    // Leggi la risposta (con timeout)
-                    byte[] responseBuffer = new byte[1024];
-                    var readTask = stream.ReadAsync(responseBuffer, 0, responseBuffer.Length);
-                    var readCompleted = await Task.WhenAny(readTask, Task.Delay(2000));
-
-                    if (readCompleted == readTask && readTask.Result > 0)
-                    {
-                        string response = System.Text.Encoding.ASCII.GetString(responseBuffer, 0, readTask.Result);
-                        // Parsing semplificato della risposta TWS
-                        // In produzione, implementeresti il parser completo del protocollo TWS
-                        if (!string.IsNullOrEmpty(response))
-                        {
-                            // Prova ad estrarre il prezzo dalla risposta
-                            var parts = response.Split('\x00');
-                            if (parts.Length > 2 && decimal.TryParse(parts[2], out decimal price))
-                            {
-                                return price > 0 ? price : -1m;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        catch { }
-        return -1m;
-    }
-
-    // Mantieni il vecchio metodo per compatibilità (non usato, solo per reference)
-    private async Task<decimal> GetPriceFromTwsSnapshot(string conId, string ibSymbol)
-    {
-        // Questo metodo è deprecato - usa GetPriceFromTwsDirectSocket
-        return -1m;
     }
 
     private decimal GetDemoPrice(string ibSymbol)
@@ -432,27 +233,20 @@ public class InteractiveBrokersDataService
         };
     }
 
-    private string GetContractId(string ibSymbol)
+    // Contratto IB per un titolo del mercato italiano (Borsa Italiana / Euronext Milan).
+    // FTSEMIB è un indice e richiede un routing diverso da SMART.
+    private Contract BuildItalianContract(string ibSymbol)
     {
-        // Mappa simboli ai loro Contract IDs in Interactive Brokers
-        return ibSymbol switch
+        var bareSymbol = ibSymbol.Split('.')[0];
+        var isIndex = bareSymbol == "FTSEMIB";
+
+        return new Contract
         {
-            "ENI.MI" => "272093",      // Eni
-            "ISP.MI" => "272093",      // Intesa Sanpaolo
-            "UCG.MI" => "272093",      // UniCredit
-            "TIT.MI" => "272093",      // Telecom Italia
-            "BAMI.MI" => "272093",     // Banco di Napoli
-            "BPE.MI" => "272093",      // Banca Popolare Emilia
-            "STM.MI" => "272093",      // STMicroelectronics
-            "ENEL.MI" => "272093",     // Enel
-            "AZM.MI" => "272093",      // Mediobanca
-            "FTSEMIB.MIX" => "272093", // FTSE MIB
-            "EQNR.MI" => "272093",     // Equinor
-            "EXS2.MI" => "272093",     // iShares MSCI World
-            "VWRL.MI" => "272093",     // Vanguard FTSE World
-            "MICC.MI" => "272093",     // Mediobanca
-            "UNL.MI" => "272093",      // Unilever
-            _ => ""
+            SecurityType = isIndex ? ContractSecurityType.Index : ContractSecurityType.Stock,
+            Symbol = bareSymbol,
+            Currency = "EUR",
+            Exchange = isIndex ? "BVME" : "SMART",
+            PrimaryExchange = isIndex ? "" : "BVME"
         };
     }
 
@@ -514,17 +308,12 @@ public class InteractiveBrokersDataService
         try
         {
             // Usa SOLO connessione TWS diretta
-            if (_sessionId != "tws_direct_socket")
+            if (_sessionId != "tws_direct_socket" || _ibClient == null)
             {
-                return null; // NO fallback a Gateway
+                return null;
             }
 
-            var conId = GetContractId(ibSymbol);
-            if (string.IsNullOrEmpty(conId))
-                return null;
-
-            // Recupera candele da TWS diretto tramite socket
-            var candles = await GetCandlesFromTwsDirectSocket(conId, ibSymbol, interval, limit);
+            var candles = await GetCandlesFromTwsAsync(ibSymbol, interval, limit);
             if (candles != null && candles.Count >= 50)
             {
                 return candles;
@@ -539,63 +328,70 @@ public class InteractiveBrokersDataService
         }
     }
 
-    private async Task<List<Candle>> GetCandlesFromTwsDirectSocket(string conId, string ibSymbol, string interval, int limit)
+    private async Task<List<Candle>> GetCandlesFromTwsAsync(string ibSymbol, string interval, int limit)
     {
+        if (_ibClient == null)
+            return null;
+
         try
         {
-            using (var client = new System.Net.Sockets.TcpClient())
-            {
-                var connectTask = client.ConnectAsync("localhost", 7497);
-                var completed = await Task.WhenAny(connectTask, Task.Delay(3000));
+            var contract = BuildItalianContract(ibSymbol);
+            var barSize = ConvertIntervalToBarSize(interval);
+            var requestId = _ibClient.Request.GetNextId();
 
-                if (completed != connectTask || !client.Connected)
-                    return null;
+            var historicalDataTask = _ibClient.Response
+                .OfType<HistoricalData>()
+                .Where(h => h.RequestId == requestId)
+                .Timeout(TimeSpan.FromSeconds(15))
+                .FirstAsync()
+                .ToTask();
 
-                using (var stream = client.GetStream())
+            _ibClient.Request.RequestHistoricalData(
+                requestId,
+                contract,
+                endDateTime: "",
+                duration: HistoricalDataDuration.OneMonth,
+                barSize: barSize,
+                whatToShow: HistoricalDataWhatToShow.Trades,
+                regularTradingHoursOnly: true,
+                dateFormat: 2, // secondi Unix, più semplice da convertire
+                keepUpToDate: false);
+
+            var historicalData = await historicalDataTask;
+
+            return historicalData.Bars
+                .Select(bar => new Candle
                 {
-                    // Comando TWS per richiedere dati storici
-                    // queryHistoricalData|id|conId|endDateTime|duration|durationUnit|barSize|whatToShow|useRTH|formatDate|keepUpToDate
-                    string histCommand = $"1\x00queryHistoricalData\x001\x00{conId}\x00\x001\x00{limit}\x00D\x001\x00MIDPOINT\x001\x001\x00";
-
-                    byte[] buffer = System.Text.Encoding.ASCII.GetBytes(histCommand);
-                    stream.Write(buffer, 0, buffer.Length);
-                    stream.Flush();
-
-                    byte[] responseBuffer = new byte[4096];
-                    var readTask = stream.ReadAsync(responseBuffer, 0, responseBuffer.Length);
-                    var readCompleted = await Task.WhenAny(readTask, Task.Delay(2000));
-
-                    if (readCompleted == readTask && readTask.Result > 0)
-                    {
-                        // Parsing risposta TWS - semplificato
-                        // In produzione, implementeresti il parser completo
-                        string response = System.Text.Encoding.ASCII.GetString(responseBuffer, 0, readTask.Result);
-
-                        // Per ora ritorna null - il client completo richiede implementazione IBApi
-                        return null;
-                    }
-                }
-            }
+                    Time = UnixTimeStampToDateTime(long.Parse(bar.Time)),
+                    Open = (decimal)bar.Open,
+                    High = (decimal)bar.High,
+                    Low = (decimal)bar.Low,
+                    Close = (decimal)bar.Close,
+                    Volume = bar.Volume
+                })
+                .OrderBy(c => c.Time)
+                .TakeLast(limit)
+                .ToList();
         }
-        catch { }
-        return null;
+        catch (Exception ex)
+        {
+            Console.WriteLine($"   ⚠️  TWS dati storici ({ibSymbol}): {ex.Message}");
+            return null;
+        }
     }
 
-    // Metodo deprecato - non usare più (era legato al Client Portal Gateway)
-    // Ora tutte le funzioni usano SOLO la connessione TWS diretta su socket porta 7497
-
-    private string ConvertIntervalToIb(string interval)
+    private string ConvertIntervalToBarSize(string interval)
     {
         return interval.ToLower() switch
         {
-            "1m" => "1",
-            "5m" => "5",
-            "15m" => "15",
-            "30m" => "30",
-            "1h" => "1h",
-            "4h" => "4h",
-            "1d" => "1d",
-            _ => "1h"
+            "1m" => HistoricalDataBarSize.OneMinute,
+            "5m" => HistoricalDataBarSize.FiveMinutes,
+            "15m" => HistoricalDataBarSize.FifteenMinutes,
+            "30m" => HistoricalDataBarSize.ThirtyMinutes,
+            "1h" => HistoricalDataBarSize.OneHour,
+            "4h" => HistoricalDataBarSize.FourHours,
+            "1d" => HistoricalDataBarSize.OneDay,
+            _ => HistoricalDataBarSize.OneHour
         };
     }
 
@@ -624,11 +420,7 @@ public class InteractiveBrokersDataService
     {
         var status = $"📊 Data Source: {_currentDataSource}";
 
-        if (_fallbackToFinnhub)
-        {
-            status += " [FALLBACK ATTIVO]";
-        }
-        else if (_sessionId == "tws_direct_socket")
+        if (_sessionId == "tws_direct_socket")
         {
             status += " [PRIMARY]";
         }

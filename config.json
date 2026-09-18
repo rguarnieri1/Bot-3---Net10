@@ -117,16 +117,9 @@
     "rateLimit": 50
   },
   "fallbackSystem": {
-    "enabled": true,
+    "enabled": false,
     "primary": "InteractiveBrokersTWS",
-    "fallback": [
-      {
-        "order": 1,
-        "source": "FinnhubAPI",
-        "endpoint": "https://finnhub.io/api/v1",
-        "enabled": true
-      }
-    ]
+    "fallback": []
   },
   "optimization": {
     "description": "Configurazione ottimizzata per target 55% win-rate su €1000",
