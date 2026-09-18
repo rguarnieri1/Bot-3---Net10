@@ -1,0 +1,138 @@
+{
+  "bot": {
+    "name": "Bot Cripto v1.1 - OPTIMIZED",
+    "description": "Trading Bot Automatico con Risk Management",
+    "version": "1.1",
+    "mode": "Conservative Trading"
+  },
+  "account": {
+    "initialCapital": 150,
+    "riskPerTrade": 0.01,
+    "maxPositionSize": 0.10,
+    "maxLeverage": 1.5,
+    "rewardRiskRatio": 2.0,
+    "commissionsPercent": 0.10,
+    "taxRate": 0.26
+  },
+  "monitoring": {
+    "intervalMinutes": 15,
+    "enableNotifications": true,
+    "maxCryptocurrenciesToAnalyze": 25,
+    "candleTimeframe": "4h",
+    "candlesLookback": 100,
+    "minVolumeFilter": true,
+    "minVolume": 1000000000,
+    "enableMetricsTracking": true
+  },
+  "strategies": {
+    "emaRibbonTrendFollowing": {
+      "enabled": true,
+      "version": 1,
+      "name": "EMA Ribbon Trend Following + Candle Confirmation",
+      "emaPeriods": [5, 10, 20, 50],
+      "volumeMultiplierThreshold": 1.2,
+      "bodyStrengthThreshold": 0.6,
+      "trendConfirmationCandles": 2,
+      "rsiOverboughtLevel": 70,
+      "rsiOversoldLevel": 30,
+      "expectedWinRate": 0.61,
+      "expectedRiskReward": 2.0,
+      "description": "Trend-following strategy using EMA ribbon alignment with candle confirmation and volume analysis"
+    },
+    "bullishDivergence": {
+      "enabled": false,
+      "version": 2,
+      "name": "Bullish Divergence V2",
+      "rsiPeriod": 14,
+      "rsiThreshold": 40,
+      "lookbackPeriods": 8,
+      "trendFilter": true,
+      "trendFilterSMA": 50,
+      "volatilityFilter": true,
+      "atrMinPercent": 0.01,
+      "volumeFilter": true,
+      "expectedWinRate": 0.56,
+      "expectedRiskReward": 2.0,
+      "priority": "backup"
+    },
+    "zeroLineCrossover": {
+      "enabled": false,
+      "version": 2,
+      "name": "Zero-Line Crossover V2",
+      "macdFastPeriod": 12,
+      "macdSlowPeriod": 26,
+      "macdSignalPeriod": 9,
+      "histogramStrengthMin": 0.05,
+      "trendFilter": true,
+      "trendFilterSMA20": 20,
+      "trendFilterSMA50": 50,
+      "rsiConfirmation": true,
+      "rsiThresholdMin": 35,
+      "rsiThresholdMax": 65,
+      "expectedWinRate": 0.56,
+      "expectedRiskReward": 2.0,
+      "priority": "disabled"
+    }
+  },
+  "riskManagement": {
+    "enabled": true,
+    "stopLossPercent": 0.03,
+    "takeProfitPercent": 0.06,
+    "trailingStopPercent": 0.02,
+    "maxConcurrentTrades": 15,
+    "positionSizingMethod": "RiskBased",
+    "validateBeforeEntry": true
+  },
+  "reporting": {
+    "generateWeeklyReport": true,
+    "reportDay": "Monday",
+    "reportTime": "00:00",
+    "saveTradingHistory": true,
+    "trackWinRate": true,
+    "trackProfitFactor": true,
+    "trackSharpeRatio": true,
+    "trackExpectancy": true,
+    "showMetricsEveryNCycles": 10
+  },
+  "notifications": {
+    "enableDesktopNotifications": true,
+    "enableSoundAlert": true,
+    "enableConsoleOutput": true,
+    "logToFile": true,
+    "logDirectory": "Logs",
+    "includeRiskMetrics": true,
+    "includePositionSize": true
+  },
+  "dataStorage": {
+    "tradingRecordFile": "Data/trades.json",
+    "reportsDirectory": "Data/Reports",
+    "logsDirectory": "Logs",
+    "metricsFile": "Data/metrics.json"
+  },
+  "api": {
+    "source": "Interactive Brokers",
+    "endpoint": "localhost:7497",
+    "timeout": 30,
+    "retryAttempts": 3,
+    "rateLimit": 50
+  },
+  "fallbackSystem": {
+    "enabled": true,
+    "primary": "InteractiveBrokersTWS",
+    "fallback": [
+      {
+        "order": 1,
+        "source": "FinnhubAPI",
+        "endpoint": "https://finnhub.io/api/v1",
+        "enabled": true
+      }
+    ]
+  },
+  "optimization": {
+    "description": "Configurazione ottimizzata per target 55% win-rate su €1000",
+    "filterFalseSignals": true,
+    "require2Indicators": false,
+    "minProfitPerTrade": 0.02,
+    "drawdownLimit": 0.25
+  }
+}
